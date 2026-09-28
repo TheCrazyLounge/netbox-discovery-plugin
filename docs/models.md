@@ -9,11 +9,21 @@ Also provides Fernet-based encryption helpers for credential storage.
 
 ## Encryption Helpers
 
+### `get_encryption_key_status()` / `encryption_available()`
+Report whether `encryption_key` is `"ok"`, `"missing"` or `"invalid"`. `checks.py` turns a non-ok status into system-check warning `netbox_discovery.W001`, and the target form and API serializer use `encryption_available()` to reject a new secret with a validation error.
+
 ### `_get_fernet()`
-Returns a `cryptography.fernet.Fernet` instance using the `encryption_key` from `PLUGINS_CONFIG`, or `None` if no key is configured.
+Returns a `cryptography.fernet.Fernet` instance for a valid `encryption_key`, or `None`.
 
 ### `encrypt_value(raw)` / `decrypt_value(stored)`
-Encrypt/decrypt a string. If no encryption key is configured (dev/test environments), values are stored and returned as plaintext. Always use these through the model property accessors — never read `_credential_password` directly.
+`encrypt_value` raises `ImproperlyConfigured` when a non-empty secret is written without a valid key. It never stores plaintext silently.
+
+`decrypt_value` returns legacy plaintext values (stored before a key existed) unchanged. It returns `""` and logs an error for a Fernet token (prefix `gAAAAA`) that cannot be decrypted because the key was removed or rotated. Previously the ciphertext itself was sent to devices as the password.
+
+Always use these through the model property accessors — never read `_credential_password` directly.
+
+### `validate_ip_lines(value, max_addresses=None)`
+Returns error messages for invalid IP/CIDR lines, and for lines larger than `max_addresses`.
 
 ---
 
@@ -37,9 +47,9 @@ models that do not declare the jobs feature.
 | `_enable_secret` | CharField(512) | Encrypted enable secret (use `.enable_secret` property) |
 | `napalm_driver` | CharField | `auto`, `ios`, `nxos_ssh`, `eos`, `junos`, `fortios` |
 | `discovery_protocol` | CharField | `lldp`, `cdp`, or `both` |
-| `max_depth` | PositiveIntegerField | Neighbor crawl recursion depth (default 3) |
-| `ssh_timeout` | PositiveIntegerField | SSH connect timeout in seconds (default 10) |
-| `max_workers` | PositiveIntegerField | Parallel crawl threads (default 5) |
+| `max_depth` | PositiveIntegerField | Neighbor crawl recursion depth (default 3, max 10) |
+| `ssh_timeout` | PositiveIntegerField | SSH connect timeout in seconds (default 10, 1–120) |
+| `max_workers` | PositiveIntegerField | Parallel crawl threads (default 5, 1–50; each worker holds a DB connection) |
 | `scan_interval` | PositiveIntegerField | Auto-run every N minutes (0 = disabled) |
 | `enabled` | BooleanField | Whether scheduled runs are active |
 | `last_run` | DateTimeField | Timestamp of last run (updated by job) |
@@ -56,6 +66,7 @@ models that do not declare the jobs feature.
 - `get_effective_password()` — per-target password or global fallback
 - `get_effective_enable_secret()` — per-target secret or global fallback
 - `get_target_list()` — parse `targets` field into `List[str]`, stripping blank lines
+- `clean()` — validates `targets` (each line must be a valid IP/CIDR of at most 65,536 addresses, i.e. an IPv4 /16) and `exclusions`. It is on the model so the REST API enforces it as well as the form.
 
 ---
 
@@ -74,6 +85,7 @@ Read-only audit log for a single execution of a `DiscoveryTarget`. Created at jo
 | `hosts_scanned` | IntegerField | Count of live IPs found |
 | `devices_created` | IntegerField | Count of new NetBox devices |
 | `devices_updated` | IntegerField | Count of updated devices |
+| `cables_created` | IntegerField | Count of cables created by the post-crawl cable sync |
 | `errors` | IntegerField | Count of connection/sync errors |
 | `log` | TextField | Full text log output (flushed per-line during run) |
 | `device_results` | JSONField | List of `{ip, hostname, status, driver, error}` per device |

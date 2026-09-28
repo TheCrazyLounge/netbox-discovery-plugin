@@ -51,13 +51,15 @@ Each entry in `data["neighbors"]`:
 
 1. **LLDP detail** (`get_lldp_neighbors_detail()`) — richest data
 2. **LLDP basic** (`get_lldp_neighbors()`) — fallback if detail fails
-3. **CDP CLI** (`show cdp neighbors detail`) — Cisco only, parsed with `_parse_cdp_neighbors()`
+3. **CDP CLI** (`show cdp neighbors detail`) — Cisco only, parsed with `_parse_cdp_neighbors()`. The parser strips the `(serial)` suffix NX-OS appends to Device IDs, so the name matches the NetBox device.
+
+LLDP and CDP entries for the same link are deduplicated on `(interface_name_key(local_interface), base_hostname(remote_hostname))` from `netbox_discovery/naming.py`. The key ignores abbreviation (`Gi1/0/1` vs `GigabitEthernet1/0/1`) and domain differences (`sw2` vs `sw2.corp.local`). LLDP entries win.
 
 ---
 
 ## Cisco Stack Detection (_detect_cisco_stack)
 
-Only runs for the `ios` driver. Executes `show switch` and `show inventory` via `device.cli()`.
+Only runs for the `ios` driver. Executes `show switch` and `show inventory` via `device.cli()`. CLI failures propagate, so the step is reported as `stack=fail`. They used to be swallowed and reported as `ok`.
 
 Returns a list of stack members:
 ```python
@@ -76,6 +78,6 @@ Returns a list of stack members:
 ## How to Change
 
 - **Add a new collection step**: Add a numbered step to `collect_device_data()`, catch exceptions, append to `raw_errors` on failure.
-- **Add a new neighbor source**: Add it to the neighbor collection block. Follow the pattern: try, merge with existing neighbors (deduplicate by `local_interface + remote_hostname + remote_interface`).
+- **Add a new neighbor source**: Add it to the neighbor collection block. Follow the pattern: try, then merge with existing neighbors (deduplicated by normalized local interface + base remote hostname).
 - **Support stack detection for NX-OS**: Add `"nxos_ssh"` to the driver check in `_detect_cisco_stack()` and parse `show module` or equivalent.
 - **Parse additional CDP fields**: Update `_parse_cdp_neighbors()` to extract more fields from the CLI output.

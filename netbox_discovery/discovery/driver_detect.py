@@ -24,10 +24,16 @@ DETECTION_ORDER = ["ios", "nxos_ssh", "junos", "fortios", "eos"]
 # Hostnames that indicate the wrong driver parsed the device's CLI output.
 # For example, the IOS driver connecting to NX-OS returns "Kernel" from the
 # Linux kernel banner that NX-OS exposes before the NX-OS prompt.
+#
+# Deliberately NOT listed: "router" / "switch" / "firewall". Those are real
+# factory-default hostnames (IOS ships as "Router" / "Switch"), and rejecting
+# them made every driver "fail", so unconfigured devices could never be
+# discovered. The sync layer already substitutes the management IP for them.
 _GARBAGE_HOSTNAMES = {
     "kernel", "localhost", "linux", "ubuntu", "debian", "centos", "redhat",
-    "router", "switch", "firewall",
 }
+# CLI error text that some drivers return as the hostname.
+_GARBAGE_HOSTNAME_FRAGMENTS = ("% invalid", "% incomplete", "% ambiguous", "invalid input")
 _UNAVAILABLE_DRIVERS = set()
 _UNAVAILABLE_DRIVERS_LOCK = threading.Lock()
 
@@ -59,6 +65,17 @@ def _looks_like_ip(s: str) -> bool:
         return all(0 <= int(p) <= 255 for p in parts)
     except ValueError:
         return False
+
+
+def _is_garbage_hostname(hostname) -> bool:
+    """True when get_facts() returned output a wrong driver misparsed as a hostname."""
+    reported = (hostname or "").strip().lower()
+    return (
+        reported in _GARBAGE_HOSTNAMES
+        or reported.startswith("^")
+        or _looks_like_ip(reported)
+        or any(fragment in reported for fragment in _GARBAGE_HOSTNAME_FRAGMENTS)
+    )
 
 
 def _safe_close(device, driver_name: str = "") -> None:
@@ -153,12 +170,7 @@ def _try_driver(
             # successfully connect to NX-OS devices but misparse the CLI and return
             # garbage like "Kernel". Treat that as a detection failure so we fall
             # through to the correct driver (nxos_ssh).
-            reported_hostname = (facts.get("hostname") or "").strip().lower()
-            if (
-                reported_hostname in _GARBAGE_HOSTNAMES
-                or reported_hostname.startswith("^")
-                or _looks_like_ip(reported_hostname)
-            ):
+            if _is_garbage_hostname(facts.get("hostname")):
                 log_fn(
                     f"    Driver '{driver_name}' connected but returned garbage hostname "
                     f"'{facts.get('hostname')}' — skipping (likely wrong driver for this OS)"

@@ -54,6 +54,7 @@ def get_discovery_options() -> dict:
         "sync_interface_speed": get_setting("sync_interface_speed"),
         "sync_fqdn": get_setting("sync_fqdn"),
         "sync_interface_vlans": get_setting("sync_interface_vlans"),
+        "prune_stale_interfaces": get_setting("prune_stale_interfaces"),
         "create_prefixes": get_setting("create_prefixes"),
         "collect_vrfs": get_setting("collect_vrfs"),
         "collect_inventory": get_setting("collect_inventory"),

@@ -10,6 +10,11 @@ from tests._loader import load_netbox_sync as load_module
 
 def _matches(obj, criteria):
     for key, expected in criteria.items():
+        if key.endswith("__net_host"):
+            attr = key[: -len("__net_host")]
+            if str(getattr(obj, attr, "")).split("/")[0] != str(expected):
+                return False
+            continue
         if key.endswith("__iexact"):
             attr = key[:-8]
             actual = getattr(obj, attr, "")
@@ -100,11 +105,16 @@ class FakeRouteTarget:
 
 
 class FakeRouteTargetManager:
+    model = types.SimpleNamespace(MultipleObjectsReturned=FakeMultipleObjectsReturned)
+
     def __init__(self):
         self.store = {}
         self.next_pk = 1
 
-    def get_or_create(self, name):
+    def filter(self, **criteria):
+        return FakeQuerySet([rt for rt in self.store.values() if _matches(rt, criteria)])
+
+    def get_or_create(self, name, defaults=None):
         if name in self.store:
             return self.store[name], False
         rt = FakeRouteTarget(pk=self.next_pk, name=name)
@@ -163,6 +173,7 @@ class SyncVrfsTests(unittest.TestCase):
             "ipam.models": fake_ipam_models,
             "django.contrib.contenttypes": fake_ct,
             "django.contrib.contenttypes.models": fake_ct_models,
+            "django.db": make_django_db_stub(),
         }):
             self.netbox_sync._sync_vrfs(vrfs_raw, device, messages.append)
 
@@ -466,6 +477,12 @@ class FakeInterface:
         self.untagged_vlan = untagged_vlan
         self.untagged_vlan_id = untagged_vlan_id
         self.tagged_vlans = FakeTaggedVlanManager()
+        self.description = ""
+        self.mtu = None
+        self.speed = None
+        self.lag_id = None
+        self.cable_id = None
+        self.mac_address = None
         self.saved = False
         self.save_calls = 0
 
@@ -1008,3 +1025,209 @@ class GetOrCreateOneTests(unittest.TestCase):
 
         self.assertEqual(obj.pk, 11)
         self.assertFalse(created)
+
+
+def _sync_fake_modules():
+    """sys.modules entries for the dcim/ipam/contenttypes/django.db imports used by sync."""
+    fake_dcim = types.ModuleType("dcim")
+    fake_dcim_models = types.ModuleType("dcim.models")
+    fake_dcim_models.Interface = FakeInterface
+    fake_ipam = types.ModuleType("ipam")
+    fake_ipam_models = types.ModuleType("ipam.models")
+    fake_ipam_models.IPAddress = FakeIPAddress
+    fake_contenttypes_models = types.ModuleType("django.contrib.contenttypes.models")
+
+    class _ContentType:
+        id = 42
+
+    fake_contenttypes_models.ContentType = types.SimpleNamespace(
+        objects=types.SimpleNamespace(get_for_model=lambda _model: _ContentType())
+    )
+    return {
+        "dcim": fake_dcim,
+        "dcim.models": fake_dcim_models,
+        "ipam": fake_ipam,
+        "ipam.models": fake_ipam_models,
+        "django": types.ModuleType("django"),
+        "django.contrib": types.ModuleType("django.contrib"),
+        "django.contrib.contenttypes": types.ModuleType("django.contrib.contenttypes"),
+        "django.contrib.contenttypes.models": fake_contenttypes_models,
+        "django.db": make_django_db_stub(),
+    }
+
+
+class MapInterfaceTypeTests(unittest.TestCase):
+    def setUp(self):
+        self.netbox_sync = load_module()
+
+    def test_full_cisco_names_map_to_their_speed_class(self):
+        # The patterns used to require a digit straight after "tengig",
+        # "hundredgig", ..., so every full name fell through to "other".
+        cases = {
+            "TenGigabitEthernet1/1/1": "10gbase-x-sfpp",
+            "TwentyFiveGigE1/0/1": "25gbase-x-sfp28",
+            "FortyGigabitEthernet1/1/1": "40gbase-x-qsfpp",
+            "HundredGigabitEthernet1/0/49": "100gbase-x-qsfp28",
+            "GigabitEthernet1/0/1": "1000base-t",
+            "Te1/1/1": "10gbase-x-sfpp",
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.netbox_sync.map_interface_type(name), expected)
+
+    def test_port_is_not_a_port_channel(self):
+        # FortiGate "port1" matched ^(...|po)\d* and was typed as a LAG.
+        self.assertNotEqual(self.netbox_sync.map_interface_type("port1"), "lag")
+        self.assertEqual(self.netbox_sync.map_interface_type("Port-channel1"), "lag")
+        self.assertEqual(self.netbox_sync.map_interface_type("Po1"), "lag")
+        self.assertEqual(self.netbox_sync.map_interface_type("ae0"), "lag")
+
+    def test_generic_names_use_reported_speed(self):
+        self.assertEqual(self.netbox_sync.map_interface_type("Ethernet1/1", 25000), "25gbase-x-sfp28")
+        self.assertEqual(self.netbox_sync.map_interface_type("port1", 1000.0), "1000base-t")
+        self.assertEqual(self.netbox_sync.map_interface_type("Ethernet1/1"), "other")
+
+
+class SelectStackMasterTests(unittest.TestCase):
+    def setUp(self):
+        self.netbox_sync = load_module()
+
+    def test_prefers_active_over_lower_numbered_standby(self):
+        members = [
+            {"position": 1, "role": "standby"},
+            {"position": 2, "role": "active"},
+            {"position": 3, "role": "member"},
+        ]
+        self.assertEqual(self.netbox_sync._select_stack_master(members)["position"], 2)
+
+    def test_falls_back_to_standby_then_lowest_position(self):
+        self.assertEqual(
+            self.netbox_sync._select_stack_master(
+                [{"position": 1, "role": "member"}, {"position": 2, "role": "standby"}]
+            )["position"],
+            2,
+        )
+        self.assertEqual(
+            self.netbox_sync._select_stack_master(
+                [{"position": 3, "role": "member"}, {"position": 2, "role": "member"}]
+            )["position"],
+            2,
+        )
+
+
+class FallbackPrimaryIpTests(unittest.TestCase):
+    """The management IP was not on any collected interface."""
+
+    def setUp(self):
+        self.netbox_sync = load_module()
+        self.device = types.SimpleNamespace(pk=1, name="edge-01")
+
+    def _run(self, interface_names, ip_rows):
+        FakeInterface.objects = FakeInterfaceManager([
+            FakeInterface(pk=index, device=self.device, name=name)
+            for index, name in enumerate(interface_names, start=1)
+        ])
+        FakeIPAddress.objects = FakeIPAddressManager(ip_rows)
+        with mock.patch.dict(sys.modules, _sync_fake_modules()):
+            return self.netbox_sync._sync_ips(
+                self.device, {}, mgmt_ip="192.0.2.50", log_fn=lambda _msg: None
+            )
+
+    def test_does_not_claim_an_ip_assigned_to_another_device(self):
+        other_device = types.SimpleNamespace(pk=2, name="other-01")
+        other_iface = FakeInterface(pk=99, device=other_device, name="Vlan10")
+        ip_rows = [FakeIPAddress(pk=1, address="192.0.2.50/24", assigned_object=other_iface)]
+
+        primary_ip, stats = self._run(["mgmt0"], ip_rows)
+
+        self.assertIsNone(primary_ip)
+        self.assertEqual(stats["conflicts"], 1)
+
+    def test_creates_host_address_on_management_interface(self):
+        primary_ip, stats = self._run(["mgmt0", "Ethernet1/1"], [])
+
+        self.assertIsNotNone(primary_ip)
+        self.assertEqual(primary_ip.address, "192.0.2.50/32")
+        self.assertEqual(primary_ip.assigned_object_id, 1)
+        self.assertEqual(stats["mgmt_created"], 1)
+
+    def test_leaves_primary_unset_without_a_management_interface(self):
+        # An unassigned primary IP makes NetBox's device form refuse to save.
+        primary_ip, stats = self._run(["Ethernet1/1"], [])
+
+        self.assertIsNone(primary_ip)
+        self.assertEqual(stats["mgmt_created"], 0)
+
+
+class SyncInterfacesTests(unittest.TestCase):
+    def setUp(self):
+        self.netbox_sync = load_module()
+        self.device = types.SimpleNamespace(pk=1, name="core-01")
+
+    def _run(self, existing, payload, options=None):
+        rows = []
+        for index, (name, iface_type) in enumerate(existing, start=1):
+            rows.append(FakeInterface(pk=index, device=self.device, name=name, type=iface_type))
+        FakeInterface.objects = FakeInterfaceManager(rows)
+        with mock.patch.dict(sys.modules, _sync_fake_modules()):
+            stats = self.netbox_sync._sync_interfaces(
+                self.device, payload, lambda _msg: None, options=options or {}
+            )
+        return rows, stats
+
+    def test_new_interfaces_get_specific_types(self):
+        rows, stats = self._run(
+            [],
+            {
+                "TenGigabitEthernet1/1/1": {"speed": 10000},
+                "Ethernet1/1": {"speed": 25000},
+                "port1": {"speed": 1000},
+            },
+        )
+        types_by_name = {row.name: row.type for row in rows}
+        self.assertEqual(types_by_name["TenGigabitEthernet1/1/1"], "10gbase-x-sfpp")
+        self.assertEqual(types_by_name["Ethernet1/1"], "25gbase-x-sfp28")
+        self.assertEqual(types_by_name["port1"], "1000base-t")
+        self.assertEqual(stats["created"], 3)
+
+    def test_operator_set_type_is_preserved(self):
+        rows, _ = self._run(
+            [("GigabitEthernet1/0/1", "1000base-x-sfp")],
+            {"GigabitEthernet1/0/1": {}},
+        )
+        self.assertEqual(rows[0].type, "1000base-x-sfp")
+
+    def test_generic_other_type_is_upgraded(self):
+        rows, _ = self._run(
+            [("TenGigabitEthernet1/1/1", "other")],
+            {"TenGigabitEthernet1/1/1": {}},
+        )
+        self.assertEqual(rows[0].type, "10gbase-x-sfpp")
+
+    def test_existing_interface_matched_case_insensitively_and_renamed(self):
+        rows, stats = self._run(
+            [("Port-Channel1", "lag")],
+            {"port-channel1": {}},
+        )
+        self.assertEqual(len(rows), 1, "must not create a second interface")
+        self.assertEqual(rows[0].name, "port-channel1")
+        self.assertEqual(stats["created"], 0)
+
+    def test_legacy_canonical_name_is_renamed_not_duplicated(self):
+        # Earlier versions stored NX-OS mgmt0 as "Management0".
+        rows, stats = self._run(
+            [("Management0", "1000base-t")],
+            {"mgmt0": {}},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].name, "mgmt0")
+        self.assertEqual(stats["created"], 0)
+
+    def test_nothing_is_pruned_by_default(self):
+        rows, stats = self._run(
+            [("GigabitEthernet1/0/1", "1000base-t"), ("GigabitEthernet1/0/2", "1000base-t")],
+            {"GigabitEthernet1/0/1": {}},
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(stats["deleted"], 0)
+        self.assertEqual(stats["stale_count"], 0)

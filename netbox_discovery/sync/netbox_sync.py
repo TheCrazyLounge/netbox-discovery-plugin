@@ -11,6 +11,21 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from netbox_discovery.naming import (
+    base_hostname as _base_hostname,
+)
+from netbox_discovery.naming import (
+    canonical_interface_name as _canonical_interface_name,
+)
+from netbox_discovery.naming import (
+    interface_name_key as _interface_name_key,
+)
+from netbox_discovery.naming import (
+    legacy_canonical_interface_name as _legacy_canonical_interface_name,
+)
+from netbox_discovery.naming import (
+    strip_device_id_serial as _strip_device_id_serial,
+)
 from netbox_discovery.sync.classify import classify_device
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
@@ -57,30 +72,57 @@ def _get_conflict_logger() -> logging.Logger:
 # Interface type mapping
 # ---------------------------------------------------------------------------
 
-# Maps name-prefix/pattern → NetBox interface type slug
+# Maps name-prefix/pattern → NetBox interface type slug. Patterns match both
+# the full names get_interfaces() returns (TenGigabitEthernet1/1/1) and the
+# abbreviations CDP uses (Te1/1/1); every alternative must be followed by a
+# digit so e.g. FortiGate "port1" is not mistaken for a port-channel.
 INTERFACE_TYPE_MAP = [
     (r"^(vlan|svi|bvi)\d*", "virtual"),
     (r"^loopback", "virtual"),
     (r"^tunnel", "virtual"),
     (r"^null", "virtual"),
-    (r"^(port-channel|bundle|ae|po)\d*", "lag"),
-    (r"^(hundredgig|hundredge|hu)\d", "100gbase-x-qsfp28"),
-    (r"^(fortygig|fortye|fo)\d", "40gbase-x-qsfpplus"),
-    (r"^(twentyfivegig|twentyfivege|twe)\d", "25gbase-x-sfp28"),
-    (r"^(tengig|tengige|te|10gige)\d", "10gbase-x-sfpp"),
-    (r"^(gigabit|gigabitethernet|gi|ge)\d", "1000base-t"),
-    (r"^(fasteth|fastethernet|fa|fe)\d", "100base-tx"),
+    (r"^(port-channel|bundle-ether|ae|po)\d", "lag"),
+    (r"^(hundredgigabitethernet|hundredgige|hu)\d", "100gbase-x-qsfp28"),
+    (r"^(fortygigabitethernet|fortygige|fo)\d", "40gbase-x-qsfpp"),
+    (r"^(twentyfivegigabitethernet|twentyfivegige|twe)\d", "25gbase-x-sfp28"),
+    (r"^(tengigabitethernet|tengige|te|10gige)\d", "10gbase-x-sfpp"),
+    (r"^(gigabitethernet|gi|ge)\d", "1000base-t"),
+    (r"^(fastethernet|fa|fe)\d", "100base-tx"),
     (r"^(serial|se)\d", "other"),
     (r"^mgmt", "1000base-t"),
     (r"^management", "1000base-t"),
 ]
 
+# Fallback for generically named ports (NX-OS/EOS "Ethernet1/1", FortiGate
+# "port1"): NAPALM reports speed in Mbps.
+_SPEED_TYPE_MAP = [
+    (400000, "400gbase-x-qsfpdd"),
+    (100000, "100gbase-x-qsfp28"),
+    (40000, "40gbase-x-qsfpp"),
+    (25000, "25gbase-x-sfp28"),
+    (10000, "10gbase-x-sfpp"),
+    (1000, "1000base-t"),
+    (100, "100base-tx"),
+]
 
-def map_interface_type(name: str) -> str:
-    """Map a NAPALM interface name to a NetBox interface type slug."""
-    n = name.lower()
+# Types this plugin may overwrite on an existing interface. Anything else was
+# either set by an operator or is already specific, and is left alone.
+# "40gbase-x-qsfpplus" is an invalid slug earlier versions wrote.
+_REPLACEABLE_INTERFACE_TYPES = {"other", "40gbase-x-qsfpplus"}
+
+
+def map_interface_type(name: str, speed_mbps=None) -> str:
+    """Map a NAPALM interface name (and optional speed) to a NetBox interface type slug."""
+    n = (name or "").lower()
     for pattern, iface_type in INTERFACE_TYPE_MAP:
         if re.match(pattern, n):
+            return iface_type
+    try:
+        speed = float(speed_mbps or 0)
+    except (TypeError, ValueError):
+        speed = 0
+    for threshold, iface_type in _SPEED_TYPE_MAP:
+        if speed == threshold:
             return iface_type
     return "other"
 
@@ -247,11 +289,15 @@ def sync_device(
         # --- Manufacturer ---
         # Use filter().first() to tolerate duplicate rows (raises MultipleObjectsReturned
         # with get_or_create when the DB already has two matching entries).
+        # Creation goes through _get_or_create_one so that two workers meeting
+        # the same new vendor/model on a first run don't lose the whole device
+        # to an IntegrityError inside this transaction.
         mfr = Manufacturer.objects.filter(name__iexact=vendor).first()
         if mfr is None:
-            mfr, _ = Manufacturer.objects.get_or_create(
-                name=vendor,
+            mfr, _ = _get_or_create_one(
+                Manufacturer.objects,
                 defaults={"slug": make_slug(vendor)},
+                name=vendor,
             )
         if not mfr.slug:
             mfr.slug = make_slug(vendor)
@@ -260,10 +306,11 @@ def sync_device(
         # --- DeviceType ---
         dtype = DeviceType.objects.filter(manufacturer=mfr, model__iexact=model).first()
         if dtype is None:
-            dtype, _ = DeviceType.objects.get_or_create(
+            dtype, _ = _get_or_create_one(
+                DeviceType.objects,
+                defaults={"slug": make_slug(f"{vendor}-{model}")},
                 manufacturer=mfr,
                 model=model,
-                defaults={"slug": make_slug(f"{vendor}-{model}")},
             )
         if not dtype.slug:
             dtype.slug = make_slug(f"{vendor}-{model}")
@@ -378,19 +425,33 @@ def sync_device(
             fqdn = (facts.get("fqdn") or "").strip()
             if fqdn:
                 try:
-                    cf = device.custom_field_data or {}
-                    if cf.get("fqdn") != fqdn:
-                        cf["fqdn"] = fqdn
-                        device.custom_field_data = cf
-                        device.save()
-                        log_fn(f"  Set FQDN custom field: {fqdn}")
+                    # Savepoint: swallowing a DB error without one leaves the
+                    # PostgreSQL transaction aborted for the rest of the device.
+                    with transaction.atomic():
+                        cf = device.custom_field_data or {}
+                        if cf.get("fqdn") != fqdn:
+                            cf["fqdn"] = fqdn
+                            device.custom_field_data = cf
+                            device.save()
+                            log_fn(f"  Set FQDN custom field: {fqdn}")
                 except Exception as exc:
                     log_fn(f"  [WARN] Could not set fqdn custom field: {exc}")
 
         # --- Interfaces ---
         interfaces_step_status = (data.get("step_status") or {}).get("interfaces")
         prune_stale = interfaces_step_status != "fail"
-        interface_stats = _sync_interfaces(device, interfaces_raw, log_fn, prune_stale=prune_stale, options=options)
+        # Interfaces reported only by get_interfaces_ip() or the LAG summary
+        # are real; never let pruning treat them as stale.
+        keep_names = set(interfaces_ip or {}) | set(lag_members or {})
+        keep_names |= {_canonical_interface_name(n) for n in keep_names}
+        interface_stats = _sync_interfaces(
+            device,
+            interfaces_raw,
+            log_fn,
+            prune_stale=prune_stale,
+            options=options,
+            keep_names=keep_names,
+        )
         interface_journal_message = _build_interface_journal_message(interface_stats)
         if interface_journal_message:
             _add_journal_entry(device, interface_journal_message)
@@ -595,9 +656,10 @@ def _ensure_site(name: str):
 
     site = Site.objects.filter(name__iexact=name).first()
     if site is None:
-        site, created = Site.objects.get_or_create(
-            name=name,
+        site, created = _get_or_create_one(
+            Site.objects,
             defaults={"slug": make_slug(name), "status": "active"},
+            name=name,
         )
         if created:
             logger.info("Created holding site: %s", name)
@@ -609,9 +671,10 @@ def _ensure_role(name: str, color: str = "9e9e9e"):
 
     role = DeviceRole.objects.filter(name__iexact=name).first()
     if role is None:
-        role, created = DeviceRole.objects.get_or_create(
-            name=name,
+        role, created = _get_or_create_one(
+            DeviceRole.objects,
             defaults={"slug": make_slug(name), "color": color},
+            name=name,
         )
         if created:
             logger.info("Created device role: %s", name)
@@ -638,9 +701,10 @@ def _sync_device_tags(device, tag_slugs: List[str], log_fn: Callable):
         if tag is None:
             # Create with a human-readable name (capitalize, replace hyphens)
             display_name = slug.replace("-", " ").title()
-            tag, created = Tag.objects.get_or_create(
-                slug=slug,
+            tag, created = _get_or_create_one(
+                Tag.objects,
                 defaults={"name": display_name},
+                slug=slug,
             )
         device.tags.add(tag)
         added.append(slug)
@@ -651,11 +715,6 @@ def _sync_device_tags(device, tag_slugs: List[str], log_fn: Callable):
             device,
             f"Discovery auto-tagged device: {', '.join(added)}.",
         )
-
-
-def _base_hostname(name: str) -> str:
-    """Return the label before the first '.' (the short hostname), lowercased."""
-    return name.split(".")[0].lower() if name else ""
 
 
 # Hostnames that are known-bad: CLI error artifacts, OS identifiers, generic labels.
@@ -744,14 +803,15 @@ def _get_or_create_device(
     if device:
         return device, False
 
-    # 2. Try match by primary IP
+    # 2. Try match by the management IP, whatever prefix length it is stored
+    #    with. This used to look up only "<ip>/32", but interface IPs are
+    #    stored with their real mask (e.g. /24), so a renamed device was
+    #    almost never matched and a duplicate was created instead.
     from ipam.models import IPAddress
 
-    mgmt_cidr = f"{mgmt_ip}/32"
-    ip_obj = IPAddress.objects.filter(address=mgmt_cidr).first()
-    if ip_obj and ip_obj.assigned_object:
+    for ip_obj in IPAddress.objects.filter(address__net_host=mgmt_ip).order_by("pk"):
         iface = ip_obj.assigned_object
-        if hasattr(iface, "device") and iface.device:
+        if iface is not None and getattr(iface, "device", None):
             return iface.device, False
 
     # 3. Try match by base hostname (same short name, different domain suffix).
@@ -773,17 +833,23 @@ def _get_or_create_device(
             )
             return device, False
 
-    # 4. Create new device
-    device = Device.objects.create(
+    # 4. Create new device. The same device can be reached through two of its
+    #    IPs by two workers at once; whoever loses the insert race reuses the
+    #    winner's row instead of failing the whole sync.
+    device, created = _get_or_create_one(
+        Device.objects,
+        defaults={
+            "site": site,
+            "device_type": device_type,
+            "role": role,
+            "serial": serial,
+            "status": "active",
+        },
         name=hostname,
-        site=site,
-        device_type=device_type,
-        role=role,
-        serial=serial,
-        status="active",
     )
-    logger.info("Created new device: %s", hostname)
-    return device, True
+    if created:
+        logger.info("Created new device: %s", hostname)
+    return device, created
 
 
 def _device_decommission_status() -> str:
@@ -883,27 +949,120 @@ def _perform_hardware_refresh(old_device, hostname: str, new_device_type, role, 
     return replacement
 
 
-def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale: bool = True, options: Optional[Dict] = None):
+# Every interface this plugin creates carries this tag. Stale-interface pruning
+# (opt-in) only ever touches tagged interfaces, so interfaces an operator or
+# another tool created are never deleted.
+DISCOVERY_TAG_SLUG = "discovered-by-nbdiscovery"
+DISCOVERY_TAG_NAME = "Discovered by nbdiscovery"
+
+
+def _tag_as_discovered(obj, log_fn: Optional[Callable] = None) -> None:
+    """Attach the discovery tag to *obj*. Best-effort; never aborts the sync."""
+    try:
+        from django.db import transaction
+        from extras.models import Tag
+    except ImportError:
+        return
+    try:
+        # Savepoint so a failure here cannot poison the device transaction.
+        with transaction.atomic():
+            tag, _ = _get_or_create_one(
+                Tag.objects,
+                defaults={"name": DISCOVERY_TAG_NAME},
+                slug=DISCOVERY_TAG_SLUG,
+            )
+            obj.tags.add(tag)
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"  [WARN] Could not tag {obj} as discovered: {exc}")
+
+
+def _get_or_create_interface(device, name: str, iface_type: str, log_fn: Callable, authoritative: bool = False):
+    """
+    Return (interface, created) for *name* on *device*.
+
+    Matching is case-insensitive: NX-OS reports "port-channel1" while older
+    plugin versions stored "Port-Channel1", and an exact-match lookup created
+    a second interface next to the first.
+
+    With authoritative=True (the name comes straight from get_interfaces()),
+    an interface stored under the name the old canonicalization produced
+    (mgmt0 → Management0, Junos ae0 → Port-Channel0) or under a different
+    case is renamed to the device's own spelling, so it keeps its cables and
+    IPs instead of being replaced.
+    """
     from dcim.models import Interface
+
+    iface = Interface.objects.filter(device=device, name__iexact=name).first()
+    if iface is None and authoritative:
+        legacy = _legacy_canonical_interface_name(name)
+        if legacy and legacy.lower() != name.lower():
+            iface = Interface.objects.filter(device=device, name__iexact=legacy).first()
+
+    if iface is not None:
+        if authoritative and iface.name != name:
+            old_name = iface.name
+            iface.name = name
+            iface.save()
+            log_fn(f"  [Interface] Renamed {device.name}/{old_name} -> {name} (device's own spelling).")
+        return iface, False
+
+    iface, created = _get_or_create_one(
+        Interface.objects,
+        defaults={"type": iface_type},
+        device=device,
+        name=name,
+    )
+    if created:
+        _tag_as_discovered(iface, log_fn)
+    return iface, created
+
+
+def _is_misclassified_lag(iface, new_type: str) -> bool:
+    """True when an earlier version typed a plain port (e.g. FortiGate port1) as a LAG."""
+    from dcim.models import Interface
+
+    if iface.type != "lag" or new_type == "lag":
+        return False
+    return Interface.objects.filter(device=iface.device, lag_id=iface.pk).first() is None
+
+
+def _sync_interfaces(
+    device,
+    interfaces_raw: Dict,
+    log_fn: Callable,
+    prune_stale: bool = True,
+    options: Optional[Dict] = None,
+    keep_names=None,
+):
+    """
+    Create/update the device's interfaces from get_interfaces() output.
+
+    prune_stale is False when get_interfaces() failed. Pruning also requires
+    the prune_stale_interfaces option, and keep_names lists interfaces
+    reported elsewhere (interfaces_ip, LAG summaries) that are not stale.
+    """
+    from dcim.models import Interface
+    from django.db import transaction
 
     if options is None:
         options = {}
     sync_speed = options.get("sync_interface_speed", True)
+    prune_enabled = options.get("prune_stale_interfaces", False)
 
     created_count = 0
     updated_count = 0
     deleted_names: List[str] = []
     delete_failed = 0
+    delete_skipped_cabled = 0
     prune_skipped = False
     normalized_raw = _normalize_interfaces_payload(interfaces_raw)
     desired_ifaces = set(normalized_raw.keys())
 
     for iface_name, iface_data in normalized_raw.items():
-        iface_type = map_interface_type(iface_name)
-        iface, created = Interface.objects.get_or_create(
-            device=device,
-            name=iface_name,
-            defaults={"type": iface_type},
+        iface_type = map_interface_type(iface_name, iface_data.get("speed"))
+        iface, created = _get_or_create_interface(
+            device, iface_name, iface_type, log_fn, authoritative=True
         )
         if created:
             created_count += 1
@@ -915,7 +1074,13 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
 
         changed_fields: List[str] = []
 
-        if iface.type != iface_type:
+        # Only replace a type we set generically ourselves. The type used to
+        # be rewritten on every run, reverting operator corrections such as
+        # 1000base-x-sfp on an SFP GigabitEthernet port.
+        if iface.type != iface_type and (
+            iface.type in _REPLACEABLE_INTERFACE_TYPES
+            or _is_misclassified_lag(iface, iface_type)
+        ):
             iface.type = iface_type
             changed_fields.append("type")
         if iface.enabled != enabled:
@@ -934,7 +1099,7 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
         if sync_speed:
             speed_mbps = iface_data.get("speed", 0) or 0
             if speed_mbps > 0:
-                speed_kbps = speed_mbps * 1000
+                speed_kbps = int(speed_mbps * 1000)
                 if iface.speed != speed_kbps:
                     iface.speed = speed_kbps
                     changed_fields.append("speed")
@@ -948,29 +1113,47 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
                     f"{', '.join(changed_fields)}"
                 )
 
-    # Only delete stale interfaces if we received a non-empty interface payload.
-    # This protects against accidental mass deletions from empty collector output.
-    existing_count = Interface.objects.filter(device=device).count()
+    # Pruning is opt-in and limited to interfaces this plugin created. It also
+    # requires a non-empty payload from a get_interfaces() call that did not
+    # fail, so empty collector output can never cause mass deletion.
     stale_count = 0
-    if desired_ifaces and not prune_stale:
+    if desired_ifaces and prune_enabled and not prune_stale:
         prune_skipped = True
         log_fn(
             f"  [WARN] Interface pruning skipped for {device.name}: "
             "get_interfaces() failed for this device in the collector."
         )
-    elif desired_ifaces:
-        stale_qs = Interface.objects.filter(device=device).exclude(name__in=desired_ifaces)
-        stale_count = stale_qs.count()
+    elif desired_ifaces and prune_enabled:
+        keep_lower = {name.lower() for name in desired_ifaces}
+        keep_lower.update(name.lower() for name in (keep_names or ()) if name)
+        stale = [
+            iface
+            for iface in Interface.objects.filter(device=device, tags__slug=DISCOVERY_TAG_SLUG)
+            if iface.name.lower() not in keep_lower
+        ]
+        stale_count = len(stale)
         if stale_count:
             log_fn(
                 f"  [Interface] Reconciling {device.name}: discovered={len(desired_ifaces)}, "
-                f"existing={existing_count}, stale={stale_count}."
+                f"stale={stale_count}."
             )
-        for stale_iface in stale_qs:
+        for stale_iface in stale:
             stale_name = stale_iface.name
+            if getattr(stale_iface, "cable_id", None):
+                # Never delete a cable: a stale interface that is still
+                # cabled is left for an operator to review.
+                delete_skipped_cabled += 1
+                log_fn(
+                    f"  [Interface] Kept stale interface {device.name}/{stale_name}: "
+                    "it still has a cable attached."
+                )
+                continue
             try:
-                _detach_interface_dependencies(stale_iface, log_fn)
-                stale_iface.delete()
+                # Savepoint: a failed delete must not abort the device's
+                # enclosing transaction.
+                with transaction.atomic():
+                    _detach_interface_dependencies(stale_iface, log_fn)
+                    stale_iface.delete()
                 deleted_names.append(stale_name)
                 log_fn(f"  [Interface] Deleted stale interface {device.name}/{stale_name}")
             except Exception as exc:
@@ -986,13 +1169,18 @@ def _sync_interfaces(device, interfaces_raw: Dict, log_fn: Callable, prune_stale
         "deleted": len(deleted_names),
         "deleted_names": deleted_names,
         "delete_failed": delete_failed,
+        "delete_skipped_cabled": delete_skipped_cabled,
         "prune_skipped": prune_skipped,
         "stale_count": stale_count,
     }
 
 
 def _detach_interface_dependencies(iface, log_fn: Callable) -> None:
-    """Remove references that commonly block stale interface deletion."""
+    """
+    Remove references that commonly block stale interface deletion.
+
+    Cables are deliberately not touched: callers skip cabled interfaces.
+    """
     from dcim.models import Interface
     from django.contrib.contenttypes.models import ContentType
     from ipam.models import IPAddress
@@ -1036,12 +1224,6 @@ def _detach_interface_dependencies(iface, log_fn: Callable) -> None:
         ips_qs.update(assigned_object_type=None, assigned_object_id=None)
         log_fn(f"  [Interface] Unassigned {ip_count} IP(s) from stale interface {iface.device.name}/{iface.name}.")
 
-    # Remove attached cable so interface deletion is not blocked.
-    cable = getattr(iface, "cable", None)
-    if cable is not None:
-        cable.delete()
-        log_fn(f"  [Interface] Deleted cable attached to stale interface {iface.device.name}/{iface.name}.")
-
 
 def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callable):
     from dcim.models import Interface
@@ -1062,11 +1244,7 @@ def _sync_lag_members(device, lag_members: Dict[str, List[str]], log_fn: Callabl
         lag_name = _canonical_interface_name(lag_name)
         lag_iface = _find_interface(device, lag_name)
         if lag_iface is None:
-            lag_iface, _ = Interface.objects.get_or_create(
-                device=device,
-                name=lag_name,
-                defaults={"type": "lag"},
-            )
+            lag_iface, _ = _get_or_create_interface(device, lag_name, "lag", log_fn)
         elif lag_iface.type != "lag":
             lag_iface.type = "lag"
             lag_iface.save()
@@ -1141,15 +1319,10 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, inter
 
     for iface_name, addr_families in interfaces_ip.items():
         iface_name = _canonical_interface_name(iface_name)
-        # Resolve the interface object
-        iface = Interface.objects.filter(device=device, name=iface_name).first()
-        if not iface:
-            # Create a minimal interface if missing
-            iface, _ = Interface.objects.get_or_create(
-                device=device,
-                name=iface_name,
-                defaults={"type": map_interface_type(iface_name)},
-            )
+        # Resolve the interface object, creating a minimal one if missing.
+        iface, _ = _get_or_create_interface(
+            device, iface_name, map_interface_type(iface_name), log_fn
+        )
 
         # addr_families is {'ipv4': {'10.0.0.1': {'prefix_length': 24}}, 'ipv6': {...}}
         for family, addrs in addr_families.items():
@@ -1215,29 +1388,79 @@ def _sync_ips(device, interfaces_ip: Dict, mgmt_ip: str, log_fn: Callable, inter
                     if not _is_interface_shutdown(iface_name, interfaces_raw):
                         primary_ip = ip_obj
 
-    # If no exact match for mgmt_ip, create a /32 for it
     if primary_ip is None and mgmt_ip:
-        mgmt_cidr = f"{mgmt_ip}/32"
-        # Try to find any existing /32 for this IP
-        primary_ip = IPAddress.objects.filter(address=mgmt_cidr).first()
-        if not primary_ip:
-            # Attach to mgmt interface if it exists, else leave unassigned
-            mgmt_iface = (
-                Interface.objects.filter(device=device, name__icontains="mgmt").first()
-                or Interface.objects.filter(device=device, name__icontains="management").first()
-            )
-            kwargs = {"status": "active"}
-            if mgmt_iface:
-                iface_ct = ContentType.objects.get_for_model(Interface)
-                kwargs["assigned_object_type"] = iface_ct
-                kwargs["assigned_object_id"] = mgmt_iface.pk
-            primary_ip, mgmt_created = _get_or_create_one(
-                IPAddress.objects, defaults=kwargs, address=mgmt_cidr
-            )
-            if mgmt_created:
-                stats["mgmt_created"] += 1
+        primary_ip = _fallback_primary_ip(device, mgmt_ip, iface_ct, stats, log_fn)
 
     return primary_ip, stats
+
+
+def _fallback_primary_ip(device, mgmt_ip: str, iface_ct, stats: Dict[str, int], log_fn: Callable):
+    """
+    Resolve a primary IP for an address that was not on any collected
+    interface (a NAT/VIP address, or get_interfaces_ip() failed).
+
+    NetBox requires a device's primary IP to be assigned to one of that
+    device's own interfaces; its device form refuses to save otherwise. This
+    used to pick whatever row matched "<ip>/32" — including one assigned to
+    a different device — or create an unassigned /32, and make it primary.
+    Now the address is only used when it already sits on this device, or is
+    free and can be attached to this device's management interface.
+    """
+    from dcim.models import Interface
+    from ipam.models import IPAddress
+
+    candidates = list(IPAddress.objects.filter(address__net_host=mgmt_ip).order_by("pk"))
+    for candidate in candidates:
+        owner = getattr(candidate.assigned_object, "device", None)
+        if owner is not None and owner.pk == device.pk:
+            return candidate
+
+    assigned_elsewhere = [c for c in candidates if c.assigned_object is not None]
+    if assigned_elsewhere:
+        other = assigned_elsewhere[0].assigned_object
+        owner_name = getattr(getattr(other, "device", None), "name", None) or str(other)
+        log_fn(
+            f"  [WARN] Management IP {mgmt_ip} is assigned to {owner_name}; "
+            f"not using it as the primary IP of {device.name}."
+        )
+        stats["conflicts"] += 1
+        return None
+
+    mgmt_iface = next(
+        (
+            iface
+            for iface in Interface.objects.filter(device=device)
+            if _is_management_interface_name(iface.name)
+        ),
+        None,
+    )
+    if mgmt_iface is None:
+        log_fn(
+            f"  [WARN] {mgmt_ip} is not on any collected interface of {device.name} and the "
+            "device has no management interface to hold it; primary IP left unchanged."
+        )
+        return None
+
+    if candidates:
+        ip_obj = candidates[0]
+        ip_obj.assigned_object_type = iface_ct
+        ip_obj.assigned_object_id = mgmt_iface.pk
+        ip_obj.save()
+        stats["reassigned"] += 1
+        return ip_obj
+
+    ip_obj, created = _get_or_create_one(
+        IPAddress.objects,
+        defaults={
+            "status": "active",
+            "assigned_object_type": iface_ct,
+            "assigned_object_id": mgmt_iface.pk,
+        },
+        address=f"{mgmt_ip}/{128 if ':' in mgmt_ip else 32}",
+    )
+    if created:
+        stats["mgmt_created"] += 1
+    return ip_obj
 
 
 def _should_preserve_existing_primary(existing_primary, candidate_primary) -> bool:
@@ -1290,6 +1513,48 @@ def _is_existing_primary_present_on_device(device, interfaces_ip: Dict) -> bool:
     return str(primary.address) in collected_cidrs
 
 
+def _select_stack_master(stack_members: List[Dict]) -> Dict:
+    """
+    Return the stack member NetBox should treat as the VC master.
+
+    Prefer the switch 'show switch' marks Active, then the Standby, then the
+    lowest position. The old one-pass search took the first member that was
+    *either* active or standby, which picked the standby whenever it had the
+    lower position.
+    """
+    for role in ("active", "standby"):
+        for member in stack_members:
+            if member.get("role") == role:
+                return member
+    return min(stack_members, key=lambda m: m.get("position", 0))
+
+
+def _free_vc_position(vc, position, keep_pk, log_fn: Callable) -> None:
+    """
+    Clear vc_position on whichever other device holds *position* in *vc*.
+
+    After a stack switchover or renumbering the slot may still belong to a
+    record from an earlier run. Saving another device there violates
+    NetBox's unique (virtual_chassis, vc_position) constraint, and that
+    IntegrityError failed the whole device on every run.
+    """
+    from dcim.models import Device
+
+    occupant = (
+        Device.objects.filter(virtual_chassis=vc, vc_position=position)
+        .exclude(pk=keep_pk)
+        .first()
+    )
+    if occupant is None:
+        return
+    occupant.vc_position = None
+    occupant.save()
+    log_fn(
+        f"  [Stack] Freed position {position} in '{vc.name}' held by '{occupant.name}' "
+        "(stack membership changed)."
+    )
+
+
 def _sync_virtual_chassis(
     master_device,
     hostname: str,
@@ -1312,11 +1577,7 @@ def _sync_virtual_chassis(
     """
     from dcim.models import Device, DeviceType, VirtualChassis
 
-    # Identify the active (master) position
-    active_entry = next(
-        (m for m in stack_members if m.get("role") in ("active", "standby")),
-        stack_members[0],
-    )
+    active_entry = _select_stack_master(stack_members)
     master_pos = active_entry["position"]
 
     # Base name without domain (used for member device names)
@@ -1330,6 +1591,14 @@ def _sync_virtual_chassis(
     )
     if vc_created:
         log_fn(f"  [Stack] Created VirtualChassis '{hostname}'")
+
+    # After a stack switchover the master's new position may still be held
+    # by the member record created for that switch on an earlier run. Saving
+    # the master there would violate NetBox's unique (virtual_chassis,
+    # vc_position) constraint and fail the whole device on every run, so move
+    # the occupant out of the slot first. The member loop below gives it the
+    # position it now reports.
+    _free_vc_position(vc, master_pos, master_device.pk, log_fn)
 
     # Assign master device to VC
     master_changed = False
@@ -1384,10 +1653,11 @@ def _sync_virtual_chassis(
                 member_dtype = found_dt
             else:
                 try:
-                    member_dtype, _ = DeviceType.objects.get_or_create(
+                    member_dtype, _ = _get_or_create_one(
+                        DeviceType.objects,
+                        defaults={"slug": make_slug(f"{master_dtype.manufacturer.name}-{member_model}")},
                         manufacturer=master_dtype.manufacturer,
                         model=member_model,
-                        defaults={"slug": make_slug(f"{master_dtype.manufacturer.name}-{member_model}")},
                     )
                 except Exception:
                     member_dtype = master_dtype  # fallback
@@ -1438,6 +1708,7 @@ def _sync_virtual_chassis(
                 changed = True
                 member_changes.append(f"virtual_chassis -> '{vc.name}'")
             if mem_dev.vc_position != pos:
+                _free_vc_position(vc, pos, mem_dev.pk, log_fn)
                 mem_dev.vc_position = pos
                 changed = True
                 member_changes.append(f"position -> {pos}")
@@ -1696,9 +1967,10 @@ def _sync_platform(device, driver_name: str, manufacturer, log_fn: Callable):
         if any(f.name == "napalm_driver" for f in Platform._meta.get_fields()):
             defaults["napalm_driver"] = driver_name
 
-        platform, created = Platform.objects.get_or_create(
-            name=driver_name,
+        platform, created = _get_or_create_one(
+            Platform.objects,
             defaults=defaults,
+            name=driver_name,
         )
         if created:
             log_fn(f"  Created Platform '{driver_name}'")
@@ -1717,6 +1989,7 @@ def _sync_platform(device, driver_name: str, manufacturer, log_fn: Callable):
 def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
     """Create Prefix records from interface IP/prefix pairs (Tier 1.4)."""
     import netaddr
+    from django.db import transaction
     from ipam.models import Prefix
 
     created_count = 0
@@ -1742,10 +2015,18 @@ def _sync_prefixes(interfaces_ip: Dict, site, log_fn: Callable):
                             defaults["scope"] = site
                         elif hasattr(Prefix, "site"):
                             defaults["site"] = site
-                    _, created = Prefix.objects.get_or_create(
-                        prefix=cidr,
-                        defaults=defaults,
-                    )
+                    # Global table only, matching the VRF-less IPs sync creates.
+                    # Plain get_or_create(prefix=...) raised
+                    # MultipleObjectsReturned whenever the same prefix also
+                    # existed in a VRF, which is routine. The savepoint keeps a
+                    # DB error here from aborting the device's transaction.
+                    with transaction.atomic():
+                        _, created = _get_or_create_one(
+                            Prefix.objects,
+                            defaults=defaults,
+                            prefix=cidr,
+                            vrf=None,
+                        )
                     if created:
                         created_count += 1
                 except Exception as exc:
@@ -1875,7 +2156,7 @@ def _sync_vrf_route_targets(vrf, rt_data: Dict, RouteTarget, log_fn: Callable):
             rt_name = rt_name.strip()
             if not rt_name:
                 continue
-            rt, created = RouteTarget.objects.get_or_create(name=rt_name)
+            rt, created = _get_or_create_one(RouteTarget.objects, name=rt_name)
             if created:
                 created_count += 1
             if rt.pk not in existing_pks:
@@ -2056,68 +2337,6 @@ def _find_interface(device, name: str):
     return None
 
 
-def _interface_name_key(name: str) -> str:
-    """Normalize interface names for loose abbreviation/full-name matching."""
-    if not name:
-        return ""
-    return _canonical_interface_name(name).lower().replace(" ", "")
-
-
-def _canonical_interface_name(name: str) -> str:
-    """Return a standardized (expanded) interface name."""
-    if not name:
-        return ""
-
-    raw = str(name).strip()
-    if not raw:
-        return ""
-
-    match = re.match(r"^([A-Za-z-]+)(.*)$", raw)
-    if not match:
-        return raw
-
-    prefix = match.group(1).lower()
-    suffix = match.group(2)
-
-    canonical_prefix = {
-        "eth": "Ethernet",
-        "et": "Ethernet",
-        "gi": "GigabitEthernet",
-        "ge": "GigabitEthernet",
-        "gigabit": "GigabitEthernet",
-        "gigabitethernet": "GigabitEthernet",
-        "fa": "FastEthernet",
-        "fe": "FastEthernet",
-        "fasteth": "FastEthernet",
-        "fastethernet": "FastEthernet",
-        "te": "TenGigabitEthernet",
-        "tengig": "TenGigabitEthernet",
-        "tengige": "TenGigabitEthernet",
-        "tengigabitethernet": "TenGigabitEthernet",
-        "fo": "FortyGigabitEthernet",
-        "fortygige": "FortyGigabitEthernet",
-        "fortygigabitethernet": "FortyGigabitEthernet",
-        "hu": "HundredGigabitEthernet",
-        "hundredgige": "HundredGigabitEthernet",
-        "hundredgigabitethernet": "HundredGigabitEthernet",
-        "twe": "TwentyFiveGigE",
-        "twentyfivege": "TwentyFiveGigE",
-        "twentyfivegigabitethernet": "TwentyFiveGigE",
-        "po": "Port-Channel",
-        "port-channel": "Port-Channel",
-        "ae": "Port-Channel",
-        "lo": "Loopback",
-        "loopback": "Loopback",
-        "mg": "Management",
-        "ma": "Management",
-        "mgmt": "Management",
-        "management": "Management",
-        "vlan": "Vlan",
-    }.get(prefix)
-
-    return f"{canonical_prefix}{suffix}" if canonical_prefix else raw
-
-
 def _normalize_interfaces_payload(interfaces_raw: Dict) -> Dict:
     """
     Canonicalize interface names and merge duplicate entries that normalize to
@@ -2236,6 +2455,7 @@ def _add_journal_entry(obj, message: str) -> bool:
         return False
 
     try:
+        from django.db import transaction
         from extras.models import JournalEntry
     except Exception:
         return False
@@ -2245,14 +2465,19 @@ def _add_journal_entry(obj, message: str) -> bool:
         "kind": _journal_kind_info(),
         "comments": message,
     }
+    # Each attempt runs in its own savepoint: journaling is best-effort, and
+    # a swallowed DB error without one would leave the caller's transaction
+    # aborted.
     try:
-        JournalEntry.objects.create(**kwargs)
+        with transaction.atomic():
+            JournalEntry.objects.create(**kwargs)
         return True
     except TypeError:
         kwargs.pop("comments", None)
         kwargs["comment"] = message
         try:
-            JournalEntry.objects.create(**kwargs)
+            with transaction.atomic():
+                JournalEntry.objects.create(**kwargs)
             return True
         except Exception:
             return False
@@ -2312,29 +2537,48 @@ def sync_cables(neighbor_records: List[Dict], log_fn: Optional[Callable] = None)
     seen: set = set()
     processed_cables: set = set()
 
+    # Every link is reported from both ends, and _find_interface's fallback
+    # scans all of a device's interfaces, so memoize lookups for this pass.
+    device_cache: Dict[str, Any] = {}
+    iface_cache: Dict[Tuple[int, str], Any] = {}
+
+    def find_device(hostname: str):
+        key = hostname.lower()
+        if key not in device_cache:
+            device_cache[key] = _find_device_by_hostname(hostname)
+        return device_cache[key]
+
+    def find_iface(device, name: str):
+        key = (device.pk, name.lower())
+        if key not in iface_cache:
+            iface_cache[key] = _find_interface(device, name)
+        return iface_cache[key]
+
     for record in neighbor_records:
         local_hostname = record.get("hostname", "")
-        local_device = _find_device_by_hostname(local_hostname)
+        local_device = find_device(local_hostname) if local_hostname else None
         if not local_device:
             continue
 
         for nbr in record.get("neighbors", []):
             local_iface_name = nbr.get("local_interface", "")
-            remote_hostname = nbr.get("remote_hostname", "")
+            # NX-OS appends the chassis serial to its CDP Device ID
+            # ("LEAF1(FDO123)"), which never matches a NetBox device name.
+            remote_hostname = _strip_device_id_serial(nbr.get("remote_hostname", ""))
             remote_iface_name = nbr.get("remote_interface", "")
 
             if not local_iface_name or not remote_hostname or not remote_iface_name:
                 continue
 
-            local_iface = _find_interface(local_device, local_iface_name)
+            local_iface = find_iface(local_device, local_iface_name)
             if not local_iface:
                 continue
 
-            remote_device = _find_device_by_hostname(remote_hostname)
+            remote_device = find_device(remote_hostname)
             if not remote_device:
                 continue
 
-            remote_iface = _find_interface(remote_device, remote_iface_name)
+            remote_iface = find_iface(remote_device, remote_iface_name)
             if not remote_iface:
                 continue
 
@@ -2386,5 +2630,10 @@ def sync_cables(neighbor_records: List[Dict], log_fn: Optional[Callable] = None)
                     f"  [Cable] SKIP {local_device.name}/{local_iface.name}"
                     f" ↔ {remote_device.name}/{remote_iface.name}: {exc}"
                 )
+            finally:
+                # The cached instances may now carry a stale cable_id; fetch
+                # them afresh if another neighbor entry refers to them.
+                iface_cache.pop((local_device.pk, local_iface_name.lower()), None)
+                iface_cache.pop((remote_device.pk, remote_iface_name.lower()), None)
 
     return created

@@ -6,7 +6,7 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.contenttypes.models import ContentType
 from django.core.paginator import Paginator
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views import View
@@ -180,6 +180,15 @@ class MergeDevicesView(LoginRequiredMixin, ObjectPermissionRequiredMixin, View):
                 "Remove those references and try again.",
             )
             return redirect("plugins:netbox_discovery:duplicate_devices")
+        except IntegrityError as exc:
+            # The transaction has rolled back, so nothing was changed.
+            logger.warning("Merge of %s into %s hit a constraint: %s", duplicate.pk, keeper.pk, exc)
+            messages.error(
+                request,
+                f"Could not merge '{duplicate.name}' into '{keeper.name}': {exc}. "
+                "No changes were made.",
+            )
+            return redirect("plugins:netbox_discovery:duplicate_devices")
 
         messages.success(
             request,
@@ -235,9 +244,20 @@ def _merge_device_metadata(keeper, duplicate, holding_site_name: str) -> None:
 
     dup_vc = duplicate.virtual_chassis
     if dup_vc and not keeper.virtual_chassis:
+        position, priority = duplicate.vc_position, duplicate.vc_priority
+        # Release the slot first: (virtual_chassis, vc_position) is unique,
+        # and saving the keeper into a position the duplicate still held
+        # raised IntegrityError and turned the merge into a 500.
+        duplicate.virtual_chassis = None
+        duplicate.vc_position = None
+        duplicate.vc_priority = None
+        duplicate.save()
         keeper.virtual_chassis = dup_vc
-        keeper.vc_position = duplicate.vc_position
-        keeper.vc_priority = duplicate.vc_priority
+        keeper.vc_position = position
+        keeper.vc_priority = priority
+        if dup_vc.master_id == duplicate.pk:
+            dup_vc.master = keeper
+            dup_vc.save()
         changed = True
 
     if changed:
@@ -388,10 +408,29 @@ def _rehome_duplicate_virtual_chassis(keeper, duplicate) -> None:
 
 
 def _adopt_duplicate_primary_ip(keeper, duplicate) -> None:
-    duplicate_primary = getattr(duplicate, "primary_ip4", None)
-    if duplicate_primary and keeper.primary_ip4_id is None:
-        keeper.primary_ip4 = duplicate_primary
-        keeper.save()
+    """
+    Move the duplicate's primary/OOB IPs to the keeper where it has none.
+
+    These are one-to-one fields, so the duplicate has to give up an IP before
+    the keeper can take it. Assigning it to the keeper first raised
+    IntegrityError and turned the merge into a 500.
+    """
+    adopted = {}
+    for field in ("primary_ip4", "primary_ip6", "oob_ip"):
+        if not hasattr(duplicate, f"{field}_id"):
+            continue  # oob_ip only exists on NetBox 4.1+
+        ip = getattr(duplicate, field, None)
+        if ip is not None and getattr(keeper, f"{field}_id") is None:
+            adopted[field] = ip
+
+    if not adopted:
+        return
+    for field in adopted:
+        setattr(duplicate, field, None)
+    duplicate.save()
+    for field, ip in adopted.items():
+        setattr(keeper, field, ip)
+    keeper.save()
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +539,10 @@ class DiscoveryTargetRunView(LoginRequiredMixin, ObjectPermissionRequiredMixin, 
         return redirect(target.get_absolute_url())
 
     def get(self, request, pk):
-        # GET: redirect to the target page with a confirmation prompt via the template
-        target = get_object_or_404(DiscoveryTarget, pk=pk)
+        # GET: redirect to the target page with a confirmation prompt via the
+        # template. self.queryset is the permission-restricted queryset, so a
+        # user cannot probe for targets they may not see.
+        target = get_object_or_404(self.queryset, pk=pk)
         return redirect(target.get_absolute_url())
 
 

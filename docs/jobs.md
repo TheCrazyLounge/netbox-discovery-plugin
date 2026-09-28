@@ -77,5 +77,7 @@ Wrapped in `try/except ImportError` because `system_job` may not exist in all Ne
 
 - **Add a new post-crawl step**: Add it after the `sync_cables()` call (Step 6). Update the summary log and `counters` dict.
 - **Add a new counter**: Add it to the `counters` dict initialisation, increment it in `on_device`, and add a log line in the summary block. Also update `_finish_run()` if it should be persisted.
-- **Change job timeout**: Update `JOB_TIMEOUT` at the top of the file.
+- **Change job timeout**: Update `JOB_TIMEOUT` at the top of the file. The crawl gets `JOB_TIMEOUT - FINALIZE_RESERVE` (300 s held back), so cable sync and `_finish_run()` still run before RQ kills the job. Without the reserve, a long run stayed stuck at `running`.
+- The crawl receives the target's exclusions, so excluded addresses are never reached through CDP/LLDP neighbors either.
+- `cables_created` is persisted on the `DiscoveryRun`.
 - **Add a new callback to crawl()**: Add the parameter to the `crawl()` call and implement the corresponding kwarg in `neighbor.py`.

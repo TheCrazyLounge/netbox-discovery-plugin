@@ -129,6 +129,26 @@ class SessionLeakTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(device.close_calls, 1)
 
+    def test_accepts_factory_default_hostnames(self):
+        # IOS ships named "Router" / "Switch". Rejecting those made every
+        # driver "fail", so unconfigured devices could never be discovered.
+        for hostname in ("Switch", "Router", "firewall"):
+            with self.subTest(hostname=hostname):
+                device = FakeNapalmDevice(facts={"hostname": hostname})
+
+                result, _ = self._run_try_driver(device)
+
+                self.assertIs(result, device)
+                self.assertEqual(device.close_calls, 0)
+
+    def test_rejects_cli_error_text_as_hostname(self):
+        device = FakeNapalmDevice(facts={"hostname": "% Invalid input detected at '^' marker."})
+
+        result, _ = self._run_try_driver(device)
+
+        self.assertIsNone(result)
+        self.assertEqual(device.close_calls, 1)
+
     def test_does_not_close_on_success(self):
         device = FakeNapalmDevice(facts={"hostname": "core-sw-01"})
 

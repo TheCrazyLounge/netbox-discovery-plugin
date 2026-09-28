@@ -69,8 +69,7 @@ netbox_discovery = ["templates/**/*.html"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 # The tests/ suite deliberately runs without Django or NetBox; see
-# tests/_loader.py. The Django-based suite lives in netbox_discovery/tests/
-# and runs under `manage.py test`, not pytest.
+# tests/_loader.py.
 addopts = "-ra --strict-markers"
 
 [tool.ruff]

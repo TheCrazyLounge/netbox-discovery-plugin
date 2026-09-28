@@ -44,6 +44,10 @@ class DiscoveryConfig(PluginConfig):
         "sync_fqdn": True,
         "sync_interface_vlans": True,   # bind discovered VLANs to interfaces (access/trunk)
         "create_prefixes": False,       # opt-in (prefix management often manually curated)
+        # Opt-in: delete interfaces this plugin created that a device no longer
+        # reports. Cabled interfaces and interfaces created by anyone else are
+        # never deleted.
+        "prune_stale_interfaces": False,
         # Tier 2 — opt-in (new NAPALM calls, extra time per device)
         "collect_vrfs": False,
         "collect_inventory": False,
@@ -53,7 +57,8 @@ class DiscoveryConfig(PluginConfig):
     # `encryption_key` is deliberately NOT listed here: making it a hard
     # requirement would refuse to start an already-running deployment. It is
     # enforced instead by a Django system check (checks.py) plus a hard failure
-    # at the point credentials are actually written — see models.encrypt_value.
+    # at the point credentials are actually written — see models.encrypt_value
+    # and the form/serializer validation that reports it cleanly.
     required_settings = []
 
     def ready(self):
@@ -63,6 +68,8 @@ class DiscoveryConfig(PluginConfig):
 
         # Importing the jobs module is what registers DiscoveryScheduler with
         # NetBox via @system_job — it is a side-effecting import, not dead code.
+        # checks.py likewise registers its system checks on import.
+        import netbox_discovery.checks  # noqa: F401
         import netbox_discovery.jobs  # noqa: F401
 
         # Custom-field creation is deferred to post_migrate so we never touch

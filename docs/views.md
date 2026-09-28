@@ -24,9 +24,12 @@ Merges two devices: keeps one (`keep_id`), copies data from the other (`delete_i
 1. **Site**: if keeper is on the holding site and duplicate has a real site, transfer it
 2. **Serial**: copy from duplicate if keeper has none
 3. **os_version custom field**: copy from duplicate if keeper lacks it
-4. **Virtual Chassis**: if duplicate is in a VC and keeper is not, transfer VC membership (position, priority) to keeper
+4. **Virtual Chassis**: if duplicate is in a VC and keeper is not, the duplicate first gives up its slot, then the keeper takes its position and priority (and becomes master if the duplicate was). Doing it in the other order violated the unique `(virtual_chassis, vc_position)` constraint.
 5. If duplicate was the VC master: re-fetch VC from DB, set `vc.master = keeper`
 6. Detach duplicate from VC (null out fields) before deletion to avoid `ProtectedError`
+7. **Primary/OOB IPs**: `primary_ip4`, `primary_ip6` and `oob_ip` (NetBox 4.1+) move to the keeper where it has none. These are one-to-one fields, so the duplicate releases them first.
+
+The whole merge runs in one transaction. `ValueError`, `ProtectedError` and `IntegrityError` are reported as UI messages and roll back everything instead of returning a 500.
 
 **Holding site name** is read from `PLUGINS_CONFIG['netbox_discovery']['holding_site']` (default: `"Holding"`).
 

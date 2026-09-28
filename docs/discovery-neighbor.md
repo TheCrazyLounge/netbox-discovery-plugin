@@ -26,6 +26,8 @@ Main entry point. Called by `jobs.py` after host scanning.
 | `log_fn` | callable | Thread-safe log callback |
 | `stop_flag` | callable | Returns `True` to abort early |
 | `max_workers` | int | Parallel worker threads (default 5) |
+| `overall_timeout` | int | Wall-clock ceiling for the whole crawl, in seconds |
+| `exclusions` | list[str] | IPs/CIDRs never to connect to. Neighbors inside them are not queued |
 
 ### Returns
 
@@ -47,7 +49,8 @@ Uses a `queue.Queue` (work queue) and a `threading.Lock` (guards `visited` set a
 - **`visited`** — IPs already dequeued and processed (prevents re-processing)
 - **`queued`** — IPs already in the queue (prevents queue inflation from duplicate neighbor reports)
 - Worker threads pull `(ip, depth)` items from the queue. When done, they extract neighbor IPs and enqueue any not already visited/queued — but only if `depth < max_depth`.
-- Poison-pill shutdown: after `work_queue.join()` (all items processed), one `None` sentinel is enqueued per worker thread to unblock their `queue.get()` call.
+- Poison-pill shutdown: after the bounded `_join_with_deadline()` (all items processed, timeout, or cancellation), one `None` sentinel is enqueued per worker thread to unblock their `queue.get()` call.
+- On timeout or cancellation an internal `abort` event is set. Workers check it before each item, so they skip the remaining queue instead of connecting to devices after `crawl()` has returned.
 - Each worker closes its Django DB connection in a `finally` block so connections are returned to the pool.
 - Per-device output is buffered and flushed atomically as a block. Every physical line is prefixed with device context (`[ip d=depth]`, then `[hostname]` once discovered), so multiline exceptions remain attributable to the correct device.
 - Each device block ends with a compact `[SUMMARY]` line containing status, selected driver, step outcomes (`facts/interfaces/lag/ips/vlans/neighbors/stack`), warnings/errors, neighbors queued, and timing metrics (connect/collect/sync/total) for quick triage.
@@ -61,7 +64,7 @@ For each `(ip, depth)` item:
 2. Call `collect_device_data()` → all device data
 3. Call `on_device_data(ip, data, driver_name)`
 4. Extract neighbor IPs from `data["neighbors"]` via `_extract_neighbor_ips()`
-5. Enqueue unseen neighbors at `depth + 1` (if `depth < max_depth`)
+5. Enqueue unseen, non-excluded neighbors at `depth + 1` (if `depth < max_depth`)
 6. On any failure: call `on_device_failed(ip, error)`
 
 ---
