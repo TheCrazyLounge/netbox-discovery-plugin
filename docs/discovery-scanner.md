@@ -11,9 +11,9 @@ Host discovery: given a list of IP addresses and CIDR ranges, returns the set of
 Main entry point. Called by `jobs.py` before the crawl.
 
 **Logic:**
-1. Separate explicit `/32` single IPs from CIDR ranges.
+1. Separate explicit single hosts from CIDR ranges using `_is_single_host()`, which treats IPv4 `/32` and IPv6 `/128` as single hosts. The old check treated every IPv6 range from `/32` to `/127` as one address.
 2. Single IPs bypass the scanner entirely and are returned immediately — the user listed them intentionally; NAPALM will report a clean failure if unreachable.
-3. CIDR ranges are expanded and scanned with nmap (`_nmap_tcp_scan`). If nmap returns 0 results, falls back to `_tcp_probe`.
+3. CIDR ranges are expanded and scanned with nmap (`_nmap_tcp_scan`). If nmap returns 0 results, falls back to `_tcp_probe`. `_expand_targets()` skips (and logs) any range larger than `MAX_RANGE_ADDRESSES` (65,536, an IPv4 /16), which `DiscoveryTarget.clean()` also enforces at input time.
 4. Returns the union of single IPs and scan results.
 
 ---

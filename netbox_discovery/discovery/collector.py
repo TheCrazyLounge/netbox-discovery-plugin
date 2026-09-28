@@ -16,6 +16,8 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from netbox_discovery.naming import base_hostname, interface_name_key, strip_device_id_serial
+
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
 
@@ -247,12 +249,14 @@ def collect_device_data(
     # Deduplicate: when protocol="both", the same physical connection can appear
     # in both LLDP and CDP data.  Keep the first occurrence of each
     # (local_interface, remote_hostname) pair, preferring LLDP (richer data).
+    # Normalize both halves: LLDP and CDP disagree on abbreviations
+    # (Gi1/0/1 vs GigabitEthernet1/0/1) and on whether the domain is included.
     seen_pairs: set = set()
     deduped = []
     for n in neighbors:
         key = (
-            (n.get("local_interface") or "").lower(),
-            (n.get("remote_hostname") or "").lower(),
+            interface_name_key(n.get("local_interface") or ""),
+            base_hostname(n.get("remote_hostname") or ""),
         )
         if key not in seen_pairs:
             seen_pairs.add(key)
@@ -540,17 +544,15 @@ def _detect_cisco_stack(device, driver_name: str, log_fn: Callable) -> List[Dict
         [{"position": 1, "role": "active",  "serial": "FCW001", "model": "WS-C3850-48P", ...},
          {"position": 2, "role": "member",  "serial": "FCW002", "model": "WS-C3850-48P", ...}]
 
-    Returns an empty list if the device is not a stack or if the commands fail.
+    Returns an empty list if the device is not a stack. CLI failures propagate
+    so the caller reports stack=fail; returning [] here made a refused
+    'show switch' indistinguishable from a standalone switch.
     Only attempted for the 'ios' driver.
     """
     if driver_name not in ("ios",):
         return []
 
-    try:
-        output = device.cli(["show switch", "show inventory"])
-    except Exception as exc:
-        log_fn(f"    [stack] CLI failed: {exc}")
-        return []
+    output = device.cli(["show switch", "show inventory"])
 
     members = _parse_show_switch(output.get("show switch", ""))
     if len(members) <= 1:
@@ -853,7 +855,8 @@ def _parse_cdp_neighbors(output: str) -> List[Dict]:
             current = {
                 "source": "cdp",
                 "local_interface": "",
-                "remote_hostname": line.split(":", 1)[-1].strip(),
+                # NX-OS appends the chassis serial: "LEAF1(FDO21120ABC)".
+                "remote_hostname": strip_device_id_serial(line.split(":", 1)[-1].strip()),
                 "remote_interface": "",
                 "remote_ip": "",
                 "remote_description": "",

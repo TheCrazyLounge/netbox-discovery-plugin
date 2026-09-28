@@ -37,6 +37,8 @@ Bare NAPALM connection attempt. Sets `optional_args` for:
 - `secret` — enable password (if provided)
 - `read_timeout` — Netmiko per-command read timeout: `max(timeout*3, 60)` for most drivers, `max(timeout*5, 90)` for NX-OS. Prevents "Pattern not detected" errors on devices with large command output (e.g. stacked switches with 100+ interfaces).
 
+After `get_facts()`, `_is_garbage_hostname()` rejects hostnames that show the wrong driver parsed the output: `Kernel`/Linux identifiers, a `^` prefix, an IP-shaped string, or CLI error text such as `% Invalid input`. The session is closed and the next driver is tried. Factory-default names (`Router`, `Switch`, `firewall`) are deliberately accepted. Rejecting them made unconfigured devices impossible to discover, and the sync layer already replaces them with the management IP.
+
 ---
 
 ## How to Change

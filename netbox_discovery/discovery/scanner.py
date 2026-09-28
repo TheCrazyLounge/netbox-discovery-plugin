@@ -32,6 +32,21 @@ NMAP_CHUNK_TIMEOUT = 300
 # worst case; across a large range that is hours if left unbounded.
 TCP_PROBE_TIMEOUT = 900
 
+# Largest CIDR range a single target line may expand to (an IPv4 /16).
+# DiscoveryTarget.clean() enforces the same limit at input time.
+MAX_RANGE_ADDRESSES = 65536
+
+
+def _is_single_host(network: netaddr.IPNetwork) -> bool:
+    """
+    True for a /32 (IPv4) or /128 (IPv6).
+
+    The old check tested `prefixlen >= 32` before looking at the address
+    family, so every IPv6 range from /32 to /127 was treated as the single
+    address it was written with.
+    """
+    return network.prefixlen == (32 if network.version == 4 else 128)
+
 
 def _expand_targets(targets: List[str]) -> List[str]:
     """Expand a list of IPs and CIDR strings into individual IP strings."""
@@ -42,8 +57,16 @@ def _expand_targets(targets: List[str]) -> List[str]:
             continue
         try:
             network = netaddr.IPNetwork(target)
-            if network.prefixlen == 32 or (network.version == 6 and network.prefixlen == 128):
+            if _is_single_host(network):
                 ips.append(str(network.ip))
+            elif network.size > MAX_RANGE_ADDRESSES:
+                # Expanding e.g. an IPv6 /64 would never finish (and would
+                # exhaust memory first). Form/API validation rejects these;
+                # this guards rows saved before that validation existed.
+                logger.warning(
+                    "Skipping target %s: %d addresses exceeds the %d-address limit",
+                    target, network.size, MAX_RANGE_ADDRESSES,
+                )
             else:
                 for host in network.iter_hosts():
                     ips.append(str(host))
@@ -231,7 +254,7 @@ def scan_targets(
             continue
         try:
             net = netaddr.IPNetwork(target)
-            if net.prefixlen >= 32 or (net.version == 6 and net.prefixlen >= 128):
+            if _is_single_host(net):
                 single_ips.add(str(net.ip))
             else:
                 range_targets.append(target)

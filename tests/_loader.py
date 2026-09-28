@@ -108,13 +108,25 @@ def make_package_stubs(*names):
     return {name: types.ModuleType(name) for name in names}
 
 
+def load_naming():
+    """Load naming.py (pure Python, no package imports)."""
+    return load_plugin_module("netbox_discovery/naming.py", name="naming_under_test")
+
+
+def _naming_stubs():
+    """Package stubs exposing the real naming module as netbox_discovery.naming."""
+    stubs = make_package_stubs("netbox_discovery")
+    stubs["netbox_discovery.naming"] = load_naming()
+    return stubs
+
+
 def load_netbox_sync():
     """Load sync/netbox_sync.py with its package imports stubbed."""
-    stubs = make_package_stubs(
-        "netbox_discovery",
+    stubs = _naming_stubs()
+    stubs.update(make_package_stubs(
         "netbox_discovery.sync",
         "netbox_discovery.sync.classify",
-    )
+    ))
     stubs["netbox_discovery.sync.classify"].classify_device = lambda **kwargs: {}
     return load_plugin_module(
         "netbox_discovery/sync/netbox_sync.py",
@@ -126,7 +138,9 @@ def load_netbox_sync():
 def load_collector():
     """Load discovery/collector.py."""
     return load_plugin_module(
-        "netbox_discovery/discovery/collector.py", name="collector_under_test"
+        "netbox_discovery/discovery/collector.py",
+        name="collector_under_test",
+        fake_modules=_naming_stubs(),
     )
 
 
@@ -144,8 +158,30 @@ def load_scanner():
     )
 
 
-def load_neighbor():
-    """Load discovery/neighbor.py."""
+def load_neighbor(collect_device_data=None, detect_and_connect=None):
+    """
+    Load discovery/neighbor.py with its sibling imports stubbed.
+
+    neighbor.py uses package-relative imports, so it is registered under its
+    real dotted name (giving it a __package__) and the siblings it imports
+    are provided through sys.modules: the real scanner, plus stand-ins for
+    the collector and driver detection supplied by the caller.
+    """
+    stubs = make_package_stubs(
+        "netbox_discovery",
+        "netbox_discovery.discovery",
+        "netbox_discovery.discovery.collector",
+        "netbox_discovery.discovery.driver_detect",
+    )
+    stubs["netbox_discovery.discovery.collector"].collect_device_data = (
+        collect_device_data or (lambda *a, **k: {})
+    )
+    stubs["netbox_discovery.discovery.driver_detect"].detect_and_connect = (
+        detect_and_connect or (lambda *a, **k: (None, None))
+    )
+    stubs["netbox_discovery.discovery.scanner"] = load_scanner()
     return load_plugin_module(
-        "netbox_discovery/discovery/neighbor.py", name="neighbor_under_test"
+        "netbox_discovery/discovery/neighbor.py",
+        name="netbox_discovery.discovery.neighbor",
+        fake_modules=stubs,
     )

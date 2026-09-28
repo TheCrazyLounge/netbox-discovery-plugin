@@ -26,6 +26,7 @@ import netaddr
 
 from .collector import collect_device_data
 from .driver_detect import detect_and_connect
+from .scanner import _build_exclusion_set, _is_excluded
 
 logger = logging.getLogger("netbox.plugins.netbox_discovery")
 
@@ -85,6 +86,7 @@ def crawl(
     max_workers: int = 5,
     options: Optional[Dict[str, Any]] = None,
     overall_timeout: int = 3600,
+    exclusions: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Concurrent BFS crawl starting from seed_ips, following LLDP/CDP neighbors.
@@ -110,6 +112,9 @@ def crawl(
         overall_timeout: Hard wall-clock ceiling for the whole crawl, in
                          seconds. Guarantees crawl() returns rather than
                          blocking indefinitely on the work queue.
+        exclusions: IPs/CIDRs that must never be connected to. The scanner
+                    already drops them from the seeds; this stops the crawl
+                    from reaching them again through CDP/LLDP neighbors.
 
     Returns:
         Summary dict with counts.
@@ -120,6 +125,16 @@ def crawl(
         stop_flag = lambda: False
     if options is None:
         options = {}
+    exclusion_networks = _build_exclusion_set(exclusions or [])
+
+    # Set once crawl() stops waiting (timeout or cancellation). Workers check
+    # it before each item: without it they kept draining the queue — SSHing
+    # to devices and writing to NetBox — after the job had already reported
+    # its result, because the poison pills sit behind the remaining work.
+    abort = threading.Event()
+
+    def should_stop() -> bool:
+        return abort.is_set() or stop_flag()
 
     # Per-device data-collection wall-clock timeout.
     # The collector runs 5 base sequential NAPALM calls (get_facts, get_interfaces,
@@ -237,7 +252,7 @@ def crawl(
                         _buf.append(f"{prefix}{line}")
 
                 try:
-                    if stop_flag():
+                    if should_stop():
                         with lock:
                             summary["skipped"] += 1
                         continue
@@ -357,6 +372,9 @@ def crawl(
                         if depth < max_depth:
                             new_ips = _extract_neighbor_ips(data.get("neighbors", []))
                             for neighbor_ip in new_ips:
+                                if _is_excluded(neighbor_ip, exclusion_networks):
+                                    device_log(f"  Neighbor {neighbor_ip} is excluded — not queuing")
+                                    continue
                                 enqueue = False
                                 with lock:
                                     if neighbor_ip and neighbor_ip not in queued:
@@ -447,6 +465,7 @@ def crawl(
     # done, but never indefinitely — see _join_with_deadline.
     completed = _join_with_deadline(work_queue, overall_timeout, stop_flag)
     if not completed:
+        abort.set()
         summary["timed_out"] = True
         log_fn(
             f"[WARN] Crawl did not drain its work queue within {overall_timeout}s "

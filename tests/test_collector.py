@@ -39,6 +39,80 @@ Interface: GigabitEthernet1/0/2,  Port ID (outgoing port): Gi0/1
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0]["remote_ip"], "10.20.30.40")
 
+    def test_strips_nxos_serial_from_device_id(self):
+        # NX-OS reports "LEAF1(FDO21120ABC)", which never matched the NetBox
+        # device, so no cable was ever created to Nexus neighbors.
+        output = """
+Device ID:LEAF1(FDO21120ABC)
+Interface: Ethernet1/1,  Port ID (outgoing port): Ethernet1/49
+"""
+
+        parsed = self.collector._parse_cdp_neighbors(output)
+
+        self.assertEqual(parsed[0]["remote_hostname"], "LEAF1")
+
+
+class FakeCollectorDevice:
+    """NAPALM stand-in where every getter is unsupported unless overridden."""
+
+    def __init__(self, lldp=None, cli_outputs=None, cli_exc=None):
+        self._lldp = lldp or {}
+        self._cli_outputs = cli_outputs or {}
+        self._cli_exc = cli_exc
+
+    def get_facts(self):
+        return {"hostname": "sw1"}
+
+    def get_interfaces(self):
+        return {}
+
+    def get_interfaces_ip(self):
+        return {}
+
+    def get_vlans(self):
+        raise NotImplementedError
+
+    def get_lldp_neighbors_detail(self):
+        return self._lldp
+
+    def cli(self, commands):
+        if self._cli_exc:
+            raise self._cli_exc
+        return {command: self._cli_outputs.get(command, "") for command in commands}
+
+
+class CollectDeviceDataTests(unittest.TestCase):
+    def setUp(self):
+        self.collector = load_module()
+
+    def test_stack_step_reports_failure_when_cli_fails(self):
+        # _detect_cisco_stack used to swallow the CLI error and return [], so
+        # a refused 'show switch' was reported as stack=ok.
+        device = FakeCollectorDevice(cli_exc=RuntimeError("session dropped"))
+
+        data = self.collector.collect_device_data(device, "ios", "lldp", lambda _m: None)
+
+        self.assertEqual(data["step_status"]["stack"], "fail")
+
+    def test_lldp_and_cdp_duplicates_merge_across_naming_styles(self):
+        lldp = {
+            "Gi1/0/1": [
+                {"remote_system_name": "sw2.corp.local", "remote_port": "Gi1/0/48"},
+            ]
+        }
+        cdp = """
+Device ID: sw2
+Interface: GigabitEthernet1/0/1,  Port ID (outgoing port): GigabitEthernet1/0/48
+"""
+        device = FakeCollectorDevice(
+            lldp=lldp, cli_outputs={"show cdp neighbors detail": cdp}
+        )
+
+        data = self.collector.collect_device_data(device, "ios", "both", lambda _m: None)
+
+        self.assertEqual(len(data["neighbors"]), 1)
+        self.assertEqual(data["neighbors"][0]["source"], "lldp")
+
 
 class ParseIosVrfRouteTargetsTests(unittest.TestCase):
     def setUp(self):
