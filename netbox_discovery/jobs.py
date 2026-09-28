@@ -23,6 +23,12 @@ logger = logging.getLogger("netbox.plugins.netbox_discovery")
 # 1 hour — large enough for any realistic crawl
 JOB_TIMEOUT = 3600
 
+# Part of JOB_TIMEOUT withheld from the crawl for post-crawl cable sync and
+# for recording the run's result. Giving the crawl the whole budget meant RQ
+# killed a long job before cable sync or _finish_run could run, leaving the
+# DiscoveryRun stuck at "running".
+FINALIZE_RESERVE = 300
+
 # Minimum seconds between Job-status polls when checking for cancellation.
 STOP_FLAG_POLL_INTERVAL = 5.0
 
@@ -229,6 +235,7 @@ class DiscoveryJob(JobRunner):
             "hosts_scanned": 0,
             "devices_created": 0,
             "devices_updated": 0,
+            "cables_created": 0,
             "errors": 0,
         }
         log_lines = []
@@ -378,7 +385,8 @@ class DiscoveryJob(JobRunner):
                 stop_flag=stop_flag,
                 max_workers=target.max_workers,
                 options=discovery_options,
-                overall_timeout=JOB_TIMEOUT,
+                overall_timeout=JOB_TIMEOUT - FINALIZE_RESERVE,
+                exclusions=target.get_exclusion_list(),
             )
             counters["errors"] += crawl_summary.get("failed", 0)
 
@@ -461,6 +469,7 @@ def _finish_run(run, counters: dict, status: str, log_text: str, device_results:
         run.hosts_scanned = counters.get("hosts_scanned", 0)
         run.devices_created = counters.get("devices_created", 0)
         run.devices_updated = counters.get("devices_updated", 0)
+        run.cables_created = counters.get("cables_created", 0)
         run.errors = counters.get("errors", 0)
         run.log = log_text
         if device_results is not None:

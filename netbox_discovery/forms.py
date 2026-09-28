@@ -1,4 +1,3 @@
-import netaddr
 from django import forms
 from netbox.forms import NetBoxModelFilterSetForm, NetBoxModelForm
 from utilities.forms.fields import TagFilterField
@@ -8,7 +7,13 @@ from .choices import (
     DiscoveryProtocolChoices,
     NapalmDriverChoices,
 )
-from .models import DiscoveryRun, DiscoveryTarget, MacAddressTableEntry
+from .models import (
+    ENCRYPTION_KEY_HELP,
+    DiscoveryRun,
+    DiscoveryTarget,
+    MacAddressTableEntry,
+    encryption_available,
+)
 
 
 class DiscoveryTargetForm(NetBoxModelForm):
@@ -75,27 +80,22 @@ class DiscoveryTargetForm(NetBoxModelForm):
             "scan_interval": forms.NumberInput(attrs={"min": 0}),
         }
 
-    def _validate_ip_lines(self, field_name: str) -> str:
-        """Validate that every non-blank line is a valid IP address or CIDR."""
-        value = self.cleaned_data.get(field_name, "")
-        errors = []
-        for line in value.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                netaddr.IPNetwork(line)
-            except (netaddr.AddrFormatError, ValueError):
-                errors.append(f"'{line}' is not a valid IP address or CIDR range.")
-        if errors:
-            raise forms.ValidationError(errors)
-        return value
+    # targets/exclusions are validated by DiscoveryTarget.clean(), which
+    # ModelForm runs too, so the UI and the REST API apply the same rules.
 
-    def clean_targets(self):
-        return self._validate_ip_lines("targets")
-
-    def clean_exclusions(self):
-        return self._validate_ip_lines("exclusions")
+    def clean(self):
+        cleaned = super().clean()
+        # Report a missing key as a form error instead of letting
+        # encrypt_value() raise ImproperlyConfigured (a 500) on save.
+        if not encryption_available():
+            for field in ("credential_password", "enable_secret"):
+                if cleaned.get(field):
+                    self.add_error(
+                        field,
+                        "Cannot store this secret: no valid encryption_key is configured "
+                        "for the plugin. " + ENCRYPTION_KEY_HELP,
+                    )
+        return cleaned
 
     def save(self, commit=True):
         instance = super().save(commit=False)

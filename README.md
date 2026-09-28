@@ -17,7 +17,7 @@ optionally VRFs and inventory items.
 - **Optional enrichment**: Can also sync platform, interface speed, FQDN, prefixes, VRFs, and inventory items
 - **Duplicate-aware matching**: Matches by hostname, management IP, and base-hostname domain variants
 - **Holding site workflow**: New devices land in a configurable holding site, then can be auto-assigned by hostname prefix
-- **Stale interface cleanup**: Removes interfaces that are no longer reported when interface collection succeeds
+- **Optional stale interface cleanup**: With `prune_stale_interfaces` enabled, removes interfaces the plugin created that a device no longer reports (never cabled ones)
 - **Conflict logging**: Writes IP assignment conflicts to a dedicated log file for follow-up
 - **Duplicate device tools**: Includes a UI for reviewing, merging, and deleting domain-variant duplicates
 - **Built-in scheduling**: Manual runs plus recurring runs via the background scheduler
@@ -105,6 +105,10 @@ PLUGINS_CONFIG = {
         'sync_interface_speed': True,
         'sync_fqdn': True,
         'create_prefixes': False,
+
+        # Delete interfaces the plugin created that a device no longer
+        # reports (cabled interfaces are always kept). Off by default.
+        'prune_stale_interfaces': False,
 
         # Tier 2 collection options (disabled by default)
         'collect_vrfs': False,
@@ -198,7 +202,9 @@ share the same base hostname with different domain suffixes. From there you can:
 
 - Discovery updates existing devices instead of replacing them wholesale
 - Primary IP conflicts are logged and domain-variant blockers can be auto-resolved
-- Interface cleanup is conservative: stale interfaces are pruned only when interface collection succeeds
+- Interface cleanup is opt-in (`prune_stale_interfaces`). It only touches interfaces the plugin created (tagged `discovered-by-nbdiscovery`), never deletes a cable, and is skipped when interface collection failed
+- Interface names keep the device's own spelling (`mgmt0`, `ae0`, `port-channel1`); only Cisco abbreviations such as `Gi1/0/1` are expanded
+- Target exclusions also apply to neighbors found through CDP/LLDP, not just to the initial scan
 - Existing tags and user-managed data are preserved where possible
 - Prefix creation, VRF collection, and inventory collection are opt-in
 
@@ -250,6 +256,7 @@ All endpoints are under `/api/plugins/discovery/`.
 | `sync_interface_speed` | `True` | Sync interface speed from NAPALM data |
 | `sync_fqdn` | `True` | Store device FQDN in a custom field when available |
 | `create_prefixes` | `False` | Create Prefix records from discovered interface addressing |
+| `prune_stale_interfaces` | `False` | Delete plugin-created interfaces a device no longer reports (cabled interfaces are kept) |
 | `collect_vrfs` | `False` | Run `get_network_instances()` and sync VRFs |
 | `collect_inventory` | `False` | Run inventory collection and sync inventory items |
 

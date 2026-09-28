@@ -13,6 +13,10 @@ Django database migration files. Applied in order to build and evolve the plugin
 | `0001_initial.py` | Creates `DiscoveryTarget` and `DiscoveryRun` tables with all original fields |
 | `0002_discoverytarget_max_workers.py` | Adds `max_workers` field to `DiscoveryTarget` (default 5) |
 | `0003_discoveryrun_device_results.py` | Adds `device_results` JSONField to `DiscoveryRun` (default empty list) |
+| `0004_discoverytarget_exclusions.py` | Adds `exclusions` to `DiscoveryTarget` |
+| `0005_sync_model_metadata.py` | Syncs model metadata with NetBox base-model changes |
+| `0006_macaddresstableentry.py` | Creates the `MacAddressTableEntry` table |
+| `0007_target_bounds_run_cables_created.py` | Adds `DiscoveryRun.cables_created`; adds min/max validators to `max_depth`, `ssh_timeout`, `max_workers` (no schema change for those) |
 
 ---
 

@@ -65,6 +65,7 @@ class DiscoveryRunTable(NetBoxTable):
     hosts_scanned = tables.Column(verbose_name="Scanned")
     devices_created = tables.Column(verbose_name="Created")
     devices_updated = tables.Column(verbose_name="Updated")
+    cables_created = tables.Column(verbose_name="Cables")
     errors = tables.Column(verbose_name="Errors")
     actions = columns.ActionsColumn(actions=())
 
@@ -79,6 +80,7 @@ class DiscoveryRunTable(NetBoxTable):
             "hosts_scanned",
             "devices_created",
             "devices_updated",
+            "cables_created",
             "errors",
             "actions",
         )

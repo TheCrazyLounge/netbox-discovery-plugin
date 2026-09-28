@@ -51,8 +51,9 @@ UI / API:
 
 ## Key Design Decisions
 
-- **Never deletes** from NetBox — only `get_or_create` and updates
-- Credentials stored Fernet-encrypted in DB; per-target with global config fallback
+- **Never deletes devices or cables** — only race-safe `_get_or_create_one` and updates. The single exception is the opt-in `prune_stale_interfaces` setting, which deletes only uncabled interfaces the plugin itself created (tagged `discovered-by-nbdiscovery`)
+- Credentials stored Fernet-encrypted in DB; per-target with global config fallback. Writing a secret without a valid `encryption_key` fails, and system check `netbox_discovery.W001` warns about a missing key
+- Interface names keep the device's own spelling; only Cisco abbreviations are expanded (`netbox_discovery/naming.py`)
 - Holding site (`"Holding"`) used for newly discovered devices; hostname-prefix matching auto-assigns real sites
 - Domain-variant deduplication: `router1.emea.local` matches existing `router1.us.local` by base hostname
 - Primary IP conflicts with domain-variant blockers are auto-resolved

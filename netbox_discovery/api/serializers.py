@@ -1,7 +1,7 @@
 from netbox.api.serializers import NetBoxModelSerializer
 from rest_framework import serializers
 
-from ..models import DiscoveryRun, DiscoveryTarget
+from ..models import ENCRYPTION_KEY_HELP, DiscoveryRun, DiscoveryTarget, encryption_available
 
 
 class DiscoveryTargetSerializer(NetBoxModelSerializer):
@@ -58,6 +58,20 @@ class DiscoveryTargetSerializer(NetBoxModelSerializer):
         # serializer inside others.
         brief_fields = ("id", "url", "display", "name", "description", "enabled")
 
+    def validate(self, data):
+        # Report a missing encryption key as a 400 rather than letting
+        # encrypt_value() raise ImproperlyConfigured (a 500) on save.
+        if not encryption_available():
+            errors = {
+                field: "Cannot store this secret: no valid encryption_key is configured "
+                "for the plugin. " + ENCRYPTION_KEY_HELP
+                for field in ("credential_password", "enable_secret")
+                if data.get(field)
+            }
+            if errors:
+                raise serializers.ValidationError(errors)
+        return super().validate(data)
+
 
 class DiscoveryRunSerializer(NetBoxModelSerializer):
     url = serializers.HyperlinkedIdentityField(
@@ -78,6 +92,7 @@ class DiscoveryRunSerializer(NetBoxModelSerializer):
             "hosts_scanned",
             "devices_created",
             "devices_updated",
+            "cables_created",
             "errors",
             "log",
             "device_results",
@@ -100,6 +115,7 @@ class DiscoveryRunSerializer(NetBoxModelSerializer):
             "hosts_scanned",
             "devices_created",
             "devices_updated",
+            "cables_created",
             "errors",
             "log",
             "device_results",
